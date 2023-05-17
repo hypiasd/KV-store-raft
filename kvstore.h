@@ -3,28 +3,30 @@
 
 #include <iostream>
 #include <unordered_map>
-#include "tcp_server.h"
 #include <vector>
 #include <chrono>
 #include <mutex>
+#include "tcp_server.h"
+#include "buttonrpc.hpp"
+#include <thread>
 
-enum state
-{
-    follower,
-    candidate,
-    leader
-};
-class KVStore : public Server
+class KVStore
 {
 public:
+    enum state
+    {
+        follower,
+        candidate,
+        leader
+    };
     KVStore(int id, std::vector<int> &info, int election_ms, int heartbeat_ms);
     void start_timer();                                                                                                            // 启动计时线程
-    void run_timer(std::chrono::system_clock::time_point &start, std::chrono::system_clock::duration duration, std::mutex &mutex); // 开始计时
-    void handle_client(int client_socket, const char *buffer) override;
+    void run_timer(std::chrono::system_clock::time_point &start, std::chrono::system_clock::duration duration, std::mutex &mutex); // 开始计时s
     void reset_election_timer();
     void reset_heartbeat_timer();
 
 private:
+    buttonrpc server_;                                      // rpc服务器
     std::unordered_map<std::string, std::string> kv_store_; // 键值对
     int id_;                                                // 节点id
     int term_ = 0;                                          // 任期
@@ -45,7 +47,7 @@ private:
     std::thread etimer_thread_; // 选举定时器线程
     std::thread htimer_thread_; // 心跳定时器线程
     std::vector<int> nodes_;    // 所有节点的信息
-    std::vector<LogEntry> log_; // 日志
+    // std::vector<LogEntry> log_; // 日志
 };
 
 #endif
