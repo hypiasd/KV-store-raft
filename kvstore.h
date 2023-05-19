@@ -26,6 +26,18 @@ public:
     void reset_heartbeat_timer();
 
 private:
+    //// 状态
+    // 所以服务器持久性状态
+    int current_term_;          // 当前最新任期
+    int voted_for_;             // 投票给哪个节点，-1 表示没有投票
+    std::vector<LogEntry> log_; // 日志
+    // 所有服务器易失性状态
+    int commit_index_; // 已知提交的最高的日志条目的索引
+    int last_applied_; // 已被应用到状态机的最高的日志条目的索引
+    // 领导人上的易失性状态
+    std::vector<int> next_index_;  // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导人最后的日志条目的索引+1）
+    std::vector<int> match_index_; // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
+
     buttonrpc server_;                                      // rpc服务器
     std::unordered_map<std::string, std::string> kv_store_; // 键值对
     int id_;                                                // 节点id
@@ -33,7 +45,6 @@ private:
     int leader_id_;                                         // 领导者id
     state state_ = follower;                                // 当前身份
     int votes_received_;                                    // 收到的投票数
-    int voted_for_;                                         // 投票给哪个节点，-1 表示没有投票
     int num_nodes_;                                         // 总节点数
     bool etimeout_ = false;                                 // 选举超时
     bool htimeout_ = false;                                 // 心跳超时
@@ -47,7 +58,6 @@ private:
     std::thread etimer_thread_; // 选举定时器线程
     std::thread htimer_thread_; // 心跳定时器线程
     std::vector<int> nodes_;    // 所有节点的信息
-    // std::vector<LogEntry> log_; // 日志
 };
 
 #endif
