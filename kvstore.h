@@ -20,7 +20,11 @@ public:
         leader
     };
     KVStore(int id, std::vector<int> &info);
-    void start_timer();
+    void transition(state st);                 // 状态机切换状态
+    void follower_func();                      // 跟随者状态逻辑
+    void candidate_func();                     // 候选者状态逻辑
+    void leader_func();                        // 领导者状态逻辑
+    void start_timer();                        // 开启计时器
     void start_election();                     // 成为候选者，开始参加竞选
     void start_heartbeat();                    // 成为领导者，开始发送心跳
     void send2other(int id, std::string func); // 给其他节点发送信息
@@ -34,8 +38,8 @@ public:
 private:
     //// 状态
     // 所以服务器持久性状态
-    int current_term_ = 0; // 当前最新任期
-    int voted_for_ = -1;   // 投票给哪个节点，-1 表示没有投票
+    int term_ = 1;       // 当前最新任期
+    int voted_for_ = -1; // 投票给哪个节点，-1 表示没有投票
     // std::vector<LogEntry> log_; // 日志
     // 所有服务器易失性状态
     int commit_index_ = 0; // 已知提交的最高的日志条目的索引
@@ -48,7 +52,6 @@ private:
     buttonrpc client_[100];                                 // rpc客户端， 用于发送信息
     std::unordered_map<std::string, std::string> kv_store_; // 键值对
     int id_;                                                // 节点id
-    int term_ = 1;                                          // 任期
     int leader_id_ = -1;                                    // 领导者id
     state state_ = follower;                                // 当前身份
     int votes_received_ = 0;                                // 收到的投票数
@@ -63,6 +66,8 @@ private:
     std::mutex hmutex_;                                     // 心跳时间锁
     std::condition_variable cv_;                            // 条件变量
     std::mutex cv_mtx_;                                     // 互斥锁
+    std::mutex state_mtx_;                                  // 状态锁
+    std::mutex votes_mtx_;                                  // 票数锁
 
     std::thread etimer_thread_; // 选举定时器线程
     std::thread htimer_thread_; // 心跳定时器线程

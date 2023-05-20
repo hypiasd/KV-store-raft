@@ -4,6 +4,34 @@
 
 使用的buttonrpc，链接：https://github.com/button-chen/buttonrpc_cpp14
 
+```c++
+buttonrpc server_;                                      *// rpc服务器*
+
+buttonrpc client_[100];                                 *// rpc客户端， 用于发送信息*
+```
+
+```c++
+std::thread server_thread([this](int port)
+                              {
+        server_.as_server(port);
+        server_.bind("vote", &KVStore::vote, this);
+        {std::lock_guard<std::mutex> lock(cv_mtx_);
+        cv_.notify_one();}
+        {std::lock_guard<std::mutex> lock(print_mtx);
+        std::cout << "run rpc server on: " << port << std::endl;}
+        server_.run(); },
+                              nodes_[id_]);
+{
+    std::unique_lock<std::mutex> lock(cv_mtx_);
+    cv_.wait(lock);
+}
+for (int i = 0; i < num_nodes_; i++)
+{
+    client_[i].as_client("127.0.0.1", nodes_[i]);
+    client_[i].set_timeout(50); // 50ms超时重传
+}
+```
+
 ## 二、raft参数
 
 **状态**：
@@ -65,3 +93,55 @@
 | ----------- | ------------------------------------------ |
 | term        | 当前任期号，以便于候选人去更新自己的任期号 |
 | voteGranted | 候选人赢得了此张选票时为真                 |
+
+## 三、状态机
+
+```c++
+void KVStore::transition(state st)
+{
+    state_ = st;
+    switch (state_)
+    {
+    case follower:
+        follower_func();
+        break;
+    case candidate:
+        candidate_func();
+        break;
+    case leader:
+        leader_func();
+        break;
+    }
+}void KVStore::transition(state st)
+{
+    state_ = st;
+    switch (state_)
+    {
+    case follower:
+        follower_func();
+        break;
+    case candidate:
+        candidate_func();
+        break;
+    case leader:
+        leader_func();
+        break;
+    }
+}
+```
+
+## 四、候选者
+
+### 状态操作：
+
+1. 投票对象重设为-1
+
+2. 收到的票数重设为0
+
+3. 开启计时器
+
+### 接收信息操作：
+
+1. 接收候选人candidate的投票（server_绑定的vote函数）
+
+2. 接收领导者leader的心跳 （server_绑定的heartbeat函数）

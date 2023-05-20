@@ -47,7 +47,16 @@ int main()
     client[1].set_timeout(2000);
 
     std::cout << "start call..." << std::endl;
-    int foo3r = client[0].call<int>("foo_3", 10).val();
+    int t = 3;
+    while (t--)
+    {
+        std::cout << t << std::endl;
+        {
+            if (t == 2)
+                break;
+        }
+    }
+    auto foo3r = client[0].call<int>("foo_3", 10).val();
     std::cout << foo3r << std::endl;
     int foo4r = client[1].call<int>("foo_4", 10, "buttonrpc", 100, (float)10.8).val();
     std::cout << foo4r << std::endl;
