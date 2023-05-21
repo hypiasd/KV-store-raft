@@ -9,7 +9,9 @@
 #include "buttonrpc.hpp"
 #include <thread>
 #include <condition_variable>
+#include "ThreadPool.h"
 
+#define THREAD_NUM 1000
 struct RequestVoteRet
 {
     int term;          // 当前任期号，以便于候选人去更新自己的任期号
@@ -36,19 +38,20 @@ public:
         candidate,
         leader
     };
-    KVStore(int id, std::vector<int> &info);
+    KVStore(int id, std::vector<int> &info, size_t num_thread);
+    ~KVStore();
     void transition(state st);                                                                                                 // 状态机切换状态
     void follower_func();                                                                                                      // 跟随者状态逻辑
     void candidate_func();                                                                                                     // 候选者状态逻辑
     void leader_func();                                                                                                        // 领导者状态逻辑
-    void start_timer();                                                                                                        // 开启计时器
+    int start_timer();                                                                                                         // 开启计时器
     void start_election();                                                                                                     // 成为候选者，开始参加竞选
     void start_heartbeat();                                                                                                    // 成为领导者，开始发送心跳
     void send2other(int id, std::string func);                                                                                 // 给其他节点发送信息
     RequestVoteRet vote(int lid, int term, int last_log_index, int last_log_term);                                             // 服务器投票函数
     AppendEntriesRet append(int term, int lid, int prev_log_index, int prev_log_term, vector<LogEntry> &entries, int lcommit); // 追加条目，由领导人调用，用于日志条目的复制，同时也被当做心跳使用
-    void election_timeout();
-    void heartbeat_timeout();
+    int election_timeout();
+    int heartbeat_timeout();
 
 private:
     //// 状态
@@ -63,6 +66,7 @@ private:
     std::vector<int> next_index_;  // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导人最后的日志条目的索引+1）
     std::vector<int> match_index_; // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
 
+    ThreadPool *thread_pool_;                               // 线程池
     buttonrpc server_;                                      // rpc服务器
     buttonrpc client_[100];                                 // rpc客户端， 用于发送信息
     std::unordered_map<std::string, std::string> kv_store_; // 键值对

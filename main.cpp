@@ -10,7 +10,7 @@ int main()
     for (int i = 0; i < num; ++i)
     {
         threads.emplace_back([&tmp, i]()
-                             { KVStore kv(i, tmp); });
+                             { KVStore kv(i, tmp, 5); });
     }
     for (auto &thread : threads)
     {

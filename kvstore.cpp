@@ -9,12 +9,19 @@
 #include <time.h>
 
 extern std::mutex print_mtx;
-KVStore::KVStore(int id, std::vector<int> &info)
+enum ret_type
+{
+    VOTES_GETD,
+    STATE_CHANGE,
+    TIMEOUT
+};
+KVStore::KVStore(int id, std::vector<int> &info, size_t num_thread)
 {
     id_ = id;
     nodes_ = info;
     num_nodes_ = nodes_.size();
     log_.push_back(LogEntry()); // log索引从1开始
+    thread_pool_ = new ThreadPool(num_thread);
     std::thread server_thread([this](int port)
                               {
         server_.as_server(port);
@@ -46,6 +53,11 @@ KVStore::KVStore(int id, std::vector<int> &info)
     // }
 }
 
+KVStore::~KVStore()
+{
+    delete thread_pool_;
+}
+
 void KVStore::transition(state st)
 {
     {
@@ -64,9 +76,11 @@ void KVStore::transition(state st)
         leader_func();
         break;
     }
-    std::thread([&]()
-                { transition(state_); })
-        .detach();
+    thread_pool_->enqueue([&]()
+                          { transition(state_); });
+    // std::thread([&]()
+    //             { transition(state_); })
+    //     .detach();
 }
 
 void KVStore::follower_func()
@@ -85,13 +99,17 @@ void KVStore::candidate_func()
     voted_for_ = id_;
     votes_received_ = 1;
     term_++;
-    start_timer();
-    if (voted_for_ != id_)
+    int ret = start_timer();
+    {
+        std::lock_guard<std::mutex> lock(print_mtx);
+        std::cout << id_ << ":  ret for  " << ret << std::endl;
+    }
+    if (ret == STATE_CHANGE)
     {
         std::lock_guard<std::mutex> lock(state_mtx_);
         state_ = follower;
     }
-    else if (votes_received_ * 2 >= num_nodes_)
+    else if (ret == VOTES_GETD)
     {
         std::lock_guard<std::mutex> lock(state_mtx_);
         state_ = leader;
@@ -100,6 +118,10 @@ void KVStore::candidate_func()
 
 void KVStore::leader_func()
 {
+    {
+        std::lock_guard<std::mutex> lock(print_mtx);
+        std::cout << id_ << ":  I'm leader!!!!" << std::endl;
+    }
     voted_for_ = -1;
     start_timer();
     {
@@ -108,21 +130,25 @@ void KVStore::leader_func()
     }
 }
 
-void KVStore::start_timer()
+int KVStore::start_timer()
 {
     if (state_ == leader)
     {
-        htimer_thread_ = std::thread(&KVStore::heartbeat_timeout, this);
-        htimer_thread_.detach();
+        auto res = thread_pool_->enqueue_ret(&KVStore::heartbeat_timeout, this);
+        int ret = res.get();
+        return ret;
+        // htimer_thread_ = std::thread(&KVStore::heartbeat_timeout, this);
+        // htimer_thread_.detach();
     }
     else
     {
-        etimer_thread_ = std::thread(&KVStore::election_timeout, this);
+        auto res = thread_pool_->enqueue_ret(&KVStore::election_timeout, this);
         if (state_ == candidate)
         {
             start_election();
         }
-        etimer_thread_.join();
+        int ret = res.get();
+        return ret;
     }
 }
 
@@ -130,21 +156,23 @@ void KVStore::start_election()
 {
     {
         std::lock_guard<std::mutex> lock(print_mtx);
-        std::cout << id_ << ":  start election!!!" << std::endl;
-        std::cout << "term:  " << term_ << std::endl;
+        std::cout << id_ << ":  start election!!!"
+                  << "  term:  " << term_ << std::endl;
     }
 
-    std::vector<std::thread> election_threads;
     for (int i = 0; i < num_nodes_; ++i)
     {
         if (i != id_)
-            election_threads.emplace_back([this, i]()
-                                          { send2other(i, "vote"); });
+            thread_pool_->enqueue([this, i]()
+                                  { send2other(i, "vote"); });
+        // if (i != id_)
+        //     election_threads.emplace_back([this, i]()
+        //                                   { send2other(i, "vote"); });
     }
-    for (auto &thread : election_threads)
-    {
-        thread.detach();
-    }
+    // for (auto &thread : election_threads)
+    // {
+    //     thread.detach();
+    // }
 }
 
 void KVStore::start_heartbeat()
@@ -166,8 +194,12 @@ void KVStore::send2other(int id, std::string func)
             {
                 std::lock_guard<std::mutex> lock(votes_mtx_);
                 votes_received_++;
+                {
+                    std::lock_guard<std::mutex> lock(print_mtx);
+                    std::cout << id << ":  vote to  " << id_ << std::endl;
+                }
             }
-            break;
+            return;
         }
     }
 }
@@ -213,28 +245,34 @@ AppendEntriesRet KVStore::append(int term, int lid, int prev_log_index, int prev
 {
 }
 
-void KVStore::election_timeout()
+int KVStore::election_timeout()
 {
     int election_ms = rand() % 151 + 150; // 生成随机整数
     eduration_ = std::chrono::milliseconds(election_ms);
     estart_ = std::chrono::system_clock::now();
-    state start_state; // 初始状态
+    state start_state = state_; // 初始状态
 
     std::chrono::system_clock::time_point end = estart_ + eduration_;
     while (1)
     {
         // 状态改变了
         if (start_state != state_)
-            return;
+            return STATE_CHANGE;
 
         // 超时了
         if (std::chrono::system_clock::now() >= end)
-            return;
+        {
+            {
+                std::lock_guard<std::mutex> lock(print_mtx);
+                std::cout << id_ << ":  electiontimeout!" << std::endl;
+            }
+            return TIMEOUT;
+        }
 
         // 候选人达到票数要求或投票给别人了
         if (state_ == candidate && (votes_received_ * 2 >= num_nodes_ || voted_for_ != id_))
         {
-            return;
+            return VOTES_GETD;
         }
 
         {
@@ -244,7 +282,7 @@ void KVStore::election_timeout()
     }
 }
 
-void KVStore::heartbeat_timeout()
+int KVStore::heartbeat_timeout()
 {
     hstart_ = std::chrono::system_clock::now();
     hduration_ = std::chrono::milliseconds(50); // 50ms发送一次心跳
@@ -252,14 +290,16 @@ void KVStore::heartbeat_timeout()
     while (1)
     {
         if (std::chrono::system_clock::now() >= end)
+        {
             start_heartbeat();
+            {
+                std::unique_lock<std::mutex> lock(hmutex_);
+                hstart_ = std::chrono::system_clock::now();
+            }
+            end = hstart_ + hduration_;
+        }
 
         if (voted_for_ != -1)
-            return;
-
-        {
-            std::unique_lock<std::mutex> lock(hmutex_);
-            end = start + duration;
-        }
+            return 1;
     }
 }
