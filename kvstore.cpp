@@ -14,6 +14,7 @@ KVStore::KVStore(int id, std::vector<int> &info)
     id_ = id;
     nodes_ = info;
     num_nodes_ = nodes_.size();
+    log_.push_back(LogEntry()); // log索引从1开始
     std::thread server_thread([this](int port)
                               {
         server_.as_server(port);
@@ -48,49 +49,24 @@ KVStore::KVStore(int id, std::vector<int> &info)
 void KVStore::transition(state st)
 {
     {
-        std::lock_guard<std::mutex> lock(state_mtx_);
-        state_ = st;
-    }
-    {
         std::lock_guard<std::mutex> lock(print_mtx);
         std::cout << id_ << "  transit to  " << state_ << std::endl;
     }
     switch (state_)
     {
     case follower:
-    {
         follower_func();
-        std::thread([&]()
-                    { transition(candidate); })
-            .detach();
         break;
-    }
     case candidate:
-    {
         candidate_func();
-        if (votes_received_ * 2 <= num_nodes_)
-        {
-            std::thread([&]()
-                        { transition(candidate); })
-                .detach();
-        }
-        else
-        {
-            std::thread([&]()
-                        { transition(leader); })
-                .detach();
-        }
         break;
-    }
     case leader:
-    {
         leader_func();
-        std::thread([&]()
-                    { transition(follower); })
-            .detach();
         break;
     }
-    }
+    std::thread([&]()
+                { transition(state_); })
+        .detach();
 }
 
 void KVStore::follower_func()
@@ -98,6 +74,10 @@ void KVStore::follower_func()
     voted_for_ = -1;
     votes_received_ = 0;
     start_timer();
+    {
+        std::lock_guard<std::mutex> lock(state_mtx_);
+        state_ = candidate;
+    }
 }
 
 void KVStore::candidate_func()
@@ -106,18 +86,34 @@ void KVStore::candidate_func()
     votes_received_ = 1;
     term_++;
     start_timer();
+    if (voted_for_ != id_)
+    {
+        std::lock_guard<std::mutex> lock(state_mtx_);
+        state_ = follower;
+    }
+    else if (votes_received_ * 2 >= num_nodes_)
+    {
+        std::lock_guard<std::mutex> lock(state_mtx_);
+        state_ = leader;
+    }
 }
 
 void KVStore::leader_func()
 {
+    voted_for_ = -1;
+    start_timer();
+    {
+        std::lock_guard<std::mutex> lock(state_mtx_);
+        state_ = follower;
+    }
 }
 
 void KVStore::start_timer()
 {
     if (state_ == leader)
     {
-        // htimer_thread_ = std::thread(&KVStore::heartbeat_timeout, this);
-        // htimer_thread_.detach();
+        htimer_thread_ = std::thread(&KVStore::heartbeat_timeout, this);
+        htimer_thread_.detach();
     }
     else
     {
@@ -153,11 +149,6 @@ void KVStore::start_election()
 
 void KVStore::start_heartbeat()
 {
-    state_ = leader;
-    {
-        std::lock_guard<std::mutex> lock(print_mtx);
-        std::cout << id_ << ":  I'm leader!!!" << std::endl;
-    }
 }
 
 void KVStore::send2other(int id, std::string func)
@@ -168,10 +159,10 @@ void KVStore::send2other(int id, std::string func)
         {
             if (state_ != candidate)
                 break;
-            auto recv = client_[id].call<bool>("vote", id_, term_);
+            auto recv = client_[id].call<RequestVoteRet>("vote", id_, term_);
             if (recv.error_msg() == "recv timeout")
                 continue;
-            else if (recv.val())
+            else if (recv.val().vote_granted)
             {
                 std::lock_guard<std::mutex> lock(votes_mtx_);
                 votes_received_++;
@@ -181,27 +172,45 @@ void KVStore::send2other(int id, std::string func)
     }
 }
 
-bool KVStore::vote(int id, int term)
+RequestVoteRet KVStore::vote(int id, int term, int log_index, int log_term)
 {
-    if (voted_for_ == -1 && term >= term_)
+    RequestVoteRet ret;
+    if (term_ >= term)
     {
-        voted_for_ = id;
         term_ = term;
+        ret.vote_granted = false;
     }
-    // {
-    //     std::lock_guard<std::mutex> lock(print_mtx);
-    //     std::cout << id_ << ":  vote to " << voted_for_ << std::endl;
-    //     std::cout << "term is:  " << term_ << std::endl;
-    //     std::cout << "voted term is:  " << term << std::endl;
-    // }
-    if (voted_for_ == id)
+    else
     {
+        int lindex = commit_index_;
+        int lterm = log_[lindex].term;
+
+        if (log_term < lterm)
+            ret.vote_granted = false;
+        else if (log_term == lterm)
         {
-            std::lock_guard<std::mutex> lock(emutex_);
-            estart_ = std::chrono::system_clock::now();
+            if (log_index < lindex)
+                ret.vote_granted = false;
+            else if (log_index == lindex && state_ == candidate)
+                ret.vote_granted = false;
+            else
+            {
+                ret.vote_granted = true;
+                voted_for_ = id;
+            }
+        }
+        else
+        {
+            ret.vote_granted = true;
+            voted_for_ = id;
         }
     }
-    return voted_for_ == id;
+
+    return ret;
+}
+
+AppendEntriesRet KVStore::append(int term, int lid, int prev_log_index, int prev_log_term, vector<LogEntry> &entries, int lcommit)
+{
 }
 
 void KVStore::election_timeout()
@@ -209,14 +218,21 @@ void KVStore::election_timeout()
     int election_ms = rand() % 151 + 150; // 生成随机整数
     eduration_ = std::chrono::milliseconds(election_ms);
     estart_ = std::chrono::system_clock::now();
+    state start_state; // 初始状态
 
     std::chrono::system_clock::time_point end = estart_ + eduration_;
     while (1)
     {
+        // 状态改变了
+        if (start_state != state_)
+            return;
+
+        // 超时了
         if (std::chrono::system_clock::now() >= end)
             return;
 
-        if (state_ == candidate && votes_received_ * 2 >= num_nodes_)
+        // 候选人达到票数要求或投票给别人了
+        if (state_ == candidate && (votes_received_ * 2 >= num_nodes_ || voted_for_ != id_))
         {
             return;
         }
@@ -227,23 +243,23 @@ void KVStore::election_timeout()
         }
     }
 }
-// void KVStore::heartbeat_timeout()
-// {
-//     hstart_ = std::chrono::system_clock::now();
-//     hduration_ = std::chrono::milliseconds(50); // 50ms发送一次心跳
-//     std::chrono::system_clock::time_point end = hstart_ + hduration_;
-//     while (1)
-//     {
-//         if (std::chrono::system_clock::now() < end)
-//         {
-//             std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 暂停 50 毫秒
-//         }
-//         else
-//             state_ = candidate;
 
-//         {
-//             std::unique_lock<std::mutex> lock(mutex);
-//             end = start + duration;
-//         }
-//     }
-// }
+void KVStore::heartbeat_timeout()
+{
+    hstart_ = std::chrono::system_clock::now();
+    hduration_ = std::chrono::milliseconds(50); // 50ms发送一次心跳
+    std::chrono::system_clock::time_point end = hstart_ + hduration_;
+    while (1)
+    {
+        if (std::chrono::system_clock::now() >= end)
+            start_heartbeat();
+
+        if (voted_for_ != -1)
+            return;
+
+        {
+            std::unique_lock<std::mutex> lock(hmutex_);
+            end = start + duration;
+        }
+    }
+}

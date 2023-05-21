@@ -10,6 +10,23 @@
 #include <thread>
 #include <condition_variable>
 
+struct RequestVoteRet
+{
+    int term;          // 当前任期号，以便于候选人去更新自己的任期号
+    bool vote_granted; // 候选人赢得了此张选票时为真
+};
+struct AppendEntriesRet
+{
+    int term;     // 当前任期，对于领导人而言 它会更新自己的任期
+    bool success; // 如果跟随者所含有的条目和 prevLogIndex 以及 prevLogTerm 匹配上了，则为 true
+};
+struct LogEntry
+{
+    int term;
+    std::string func_name;
+    std::string key;
+    int value;
+};
 class KVStore
 {
 public:
@@ -20,27 +37,25 @@ public:
         leader
     };
     KVStore(int id, std::vector<int> &info);
-    void transition(state st);                 // 状态机切换状态
-    void follower_func();                      // 跟随者状态逻辑
-    void candidate_func();                     // 候选者状态逻辑
-    void leader_func();                        // 领导者状态逻辑
-    void start_timer();                        // 开启计时器
-    void start_election();                     // 成为候选者，开始参加竞选
-    void start_heartbeat();                    // 成为领导者，开始发送心跳
-    void send2other(int id, std::string func); // 给其他节点发送信息
-    bool vote(int id, int term);               // 服务器投票函数
+    void transition(state st);                                                                                                 // 状态机切换状态
+    void follower_func();                                                                                                      // 跟随者状态逻辑
+    void candidate_func();                                                                                                     // 候选者状态逻辑
+    void leader_func();                                                                                                        // 领导者状态逻辑
+    void start_timer();                                                                                                        // 开启计时器
+    void start_election();                                                                                                     // 成为候选者，开始参加竞选
+    void start_heartbeat();                                                                                                    // 成为领导者，开始发送心跳
+    void send2other(int id, std::string func);                                                                                 // 给其他节点发送信息
+    RequestVoteRet vote(int lid, int term, int last_log_index, int last_log_term);                                             // 服务器投票函数
+    AppendEntriesRet append(int term, int lid, int prev_log_index, int prev_log_term, vector<LogEntry> &entries, int lcommit); // 追加条目，由领导人调用，用于日志条目的复制，同时也被当做心跳使用
     void election_timeout();
-    void heartbeat_timeout();                                                                                                      // 启动计时线程
-    void run_timer(std::chrono::system_clock::time_point &start, std::chrono::system_clock::duration duration, std::mutex &mutex); // 开始计时s
-    void reset_election_timer();
-    void reset_heartbeat_timer();
+    void heartbeat_timeout();
 
 private:
     //// 状态
     // 所以服务器持久性状态
-    int term_ = 1;       // 当前最新任期
-    int voted_for_ = -1; // 投票给哪个节点，-1 表示没有投票
-    // std::vector<LogEntry> log_; // 日志
+    int term_ = 1;              // 当前最新任期
+    int voted_for_ = -1;        // 投票给哪个节点，-1 表示没有投票
+    std::vector<LogEntry> log_; // 日志
     // 所有服务器易失性状态
     int commit_index_ = 0; // 已知提交的最高的日志条目的索引
     int last_applied_ = 0; // 已被应用到状态机的最高的日志条目的索引
@@ -52,7 +67,7 @@ private:
     buttonrpc client_[100];                                 // rpc客户端， 用于发送信息
     std::unordered_map<std::string, std::string> kv_store_; // 键值对
     int id_;                                                // 节点id
-    int leader_id_ = -1;                                    // 领导者id
+    int leader_id_ = -1;                                    // 领导者id， 不存在则为-1
     state state_ = follower;                                // 当前身份
     int votes_received_ = 0;                                // 收到的投票数
     int num_nodes_;                                         // 总节点数
