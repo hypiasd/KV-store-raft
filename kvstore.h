@@ -6,6 +6,7 @@
 #include <vector>
 #include <chrono>
 #include <mutex>
+#include <shared_mutex>
 #include "buttonrpc.hpp"
 #include <thread>
 #include <condition_variable>
@@ -56,9 +57,10 @@ public:
 private:
     //// 状态
     // 所以服务器持久性状态
-    int term_ = 1;              // 当前最新任期
-    int voted_for_ = -1;        // 投票给哪个节点，-1 表示没有投票
-    std::vector<LogEntry> log_; // 日志
+    int term_ = 1;                     // 当前最新任期
+    int voted_for_ = -1;               // 投票给哪个节点，-1 表示没有投票
+    std::vector<LogEntry> log_;        // 日志
+    std::vector<LogEntry> log_tosent_; // 需要发送的日志
     // 所有服务器易失性状态
     int commit_index_ = 0; // 已知提交的最高的日志条目的索引
     int last_applied_ = 0; // 已被应用到状态机的最高的日志条目的索引
@@ -78,6 +80,7 @@ private:
     bool etimeout_ = false;                                 // 选举超时
     bool htimeout_ = false;                                 // 心跳超时
     std::chrono::system_clock::time_point estart_;          // 开始选举计时时间
+    std::chrono::system_clock::time_point eend_;            // 选举超时时刻点
     std::chrono::system_clock::duration eduration_;         // 选举计时超时时间
     std::chrono::system_clock::time_point hstart_;          // 开始心跳计时时间
     std::chrono::system_clock::duration hduration_;         // 心跳计时超时时间
@@ -85,12 +88,16 @@ private:
     std::mutex hmutex_;                                     // 心跳时间锁
     std::condition_variable cv_;                            // 条件变量
     std::mutex cv_mtx_;                                     // 互斥锁
-    std::mutex state_mtx_;                                  // 状态锁
-    std::mutex votes_mtx_;                                  // 票数锁
+    std::shared_mutex state_mtx_;                           // 状态锁
+    std::shared_mutex votes_mtx_;                           // 票数锁
+    std::shared_mutex term_mtx_;                            // 任期锁
+    std::shared_mutex log_mtx_;                             // 日志锁
 
     std::thread etimer_thread_; // 选举定时器线程
     std::thread htimer_thread_; // 心跳定时器线程
     std::vector<int> nodes_;    // 所有节点的信息
+
+    bool is_recvmsg_ = false; // 是否收到客户端信息
 };
 
 #endif
