@@ -2,6 +2,7 @@
 #include <iostream>
 #include <ctime>
 #include "buttonrpc.hpp"
+#include <thread>
 
 #ifdef _WIN32
 #include <Windows.h> // use sleep
@@ -37,27 +38,41 @@ struct PersonInfo
         return out;
     }
 };
+struct ClientReqRet
+{
+    std::string info;
+    std::string value;
+    int leader_id;
 
+    // must implement
+    friend Serializer &operator>>(Serializer &in, ClientReqRet &d)
+    {
+        in >> d.info >> d.value >> d.leader_id;
+        return in;
+    }
+    friend Serializer &operator<<(Serializer &out, ClientReqRet d)
+    {
+        out << d.info << d.value << d.leader_id;
+        return out;
+    }
+};
 int main()
 {
-    buttonrpc client;
+    buttonrpc client[3];
 
-    int callcnt = 0;
-    while (1)
-    {
-        std::cout << "current call count: " << ++callcnt << std::endl;
-
-        int port;
-        std::cout << "port: ";
-        std::cin >> port;
-        client.as_client("127.0.0.1", port);
-
-        client.set_timeout(2000);
-
-        client.call<void>("foo_1");
-
-        sleep(1);
-    }
-
+    // int callcnt = 0;
+    // for (int i = 0; i < 1; i++)
+    // {
+    //     client[i].as_client("127.0.0.1", 5555);
+    //     client[i].set_timeout(2000);
+    //     std::thread([&]()
+    //                 { client[i].call<void>("foo_1", i); })
+    //         .detach();
+    // }
+    client[0].as_client("127.0.0.1", 12343);
+    client[0].set_timeout(2000);
+    auto x = client[0].call<ClientReqRet>("request", "set", "abc", "123");
+    std::cout << x.error_msg() << std::endl;
+    std::cout << x.val().leader_id << std::endl;
     return 0;
 }

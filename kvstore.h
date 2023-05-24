@@ -11,6 +11,7 @@
 #include <thread>
 #include <condition_variable>
 #include "ThreadPool.h"
+#include "rpc.h"
 
 #define THREAD_NUM 1000
 struct RequestVoteRet
@@ -28,8 +29,15 @@ struct LogEntry
     int term;
     std::string func_name;
     std::string key;
-    int value;
+    std::string value;
 };
+struct ClientReqRet
+{
+    std::string info;
+    std::string value;
+    int leader_id;
+};
+
 class KVStore
 {
 public:
@@ -41,36 +49,47 @@ public:
     };
     KVStore(int id, std::vector<int> &info, size_t num_thread);
     ~KVStore();
-    void transition(state st);                                                                                                 // 状态机切换状态
-    void follower_func();                                                                                                      // 跟随者状态逻辑
-    void candidate_func();                                                                                                     // 候选者状态逻辑
-    void leader_func();                                                                                                        // 领导者状态逻辑
-    int start_timer();                                                                                                         // 开启计时器
-    void start_election();                                                                                                     // 成为候选者，开始参加竞选
-    void start_heartbeat();                                                                                                    // 成为领导者，开始发送心跳
-    void send2other(int id, std::string func);                                                                                 // 给其他节点发送信息
-    RequestVoteRet vote(int lid, int term, int last_log_index, int last_log_term);                                             // 服务器投票函数
-    AppendEntriesRet append(int term, int lid, int prev_log_index, int prev_log_term, vector<LogEntry> &entries, int lcommit); // 追加条目，由领导人调用，用于日志条目的复制，同时也被当做心跳使用
+    void transition(state st);                 // 状态机切换状态
+    void follower_func();                      // 跟随者状态逻辑
+    void candidate_func();                     // 候选者状态逻辑
+    void leader_func();                        // 领导者状态逻辑
+    int start_timer();                         // 开启计时器
+    void start_election();                     // 成为候选者，开始参加竞选
+    void start_heartbeat();                    // 成为领导者，开始发送心跳
+    void send2other(int id, std::string func); // 给其他节点发送信息
     int election_timeout();
     int heartbeat_timeout();
+    void apply(); // 提交并应用日志
+    // bool decode(const char *buffer) override;
+    // void handle() override;
+    // void encode() override;
+
+    RequestVoteRet vote(int lid, int term, int last_log_index, int last_log_term);                                                              // 服务器投票函数
+    AppendEntriesRet append(std::string test, int term, int lid, int prev_log_index, int prev_log_term, vector<LogEntry> entries, int lcommit); // 追加条目，由领导人调用，用于日志条目的复制，同时也被当做心跳使用
+
+    ClientReqRet request(std::string func, std::string key, std::string value); // 接收客户端请求
+    ClientReqRet set(std::string key, std::string value);                       // 添加或修改键值对
+    ClientReqRet get(std::string key);                                          // 获取对应关键字的值
+    ClientReqRet del(std::string key);
+    // 删除键值对
 
 private:
     //// 状态
     // 所以服务器持久性状态
-    int term_ = 1;                     // 当前最新任期
-    int voted_for_ = -1;               // 投票给哪个节点，-1 表示没有投票
-    std::vector<LogEntry> log_;        // 日志
-    std::vector<LogEntry> log_tosent_; // 需要发送的日志
+    int term_ = 1;              // 当前最新任期
+    int voted_for_ = -1;        // 投票给哪个节点，-1 表示没有投票
+    std::vector<LogEntry> log_; // 日志
     // 所有服务器易失性状态
     int commit_index_ = 0; // 已知提交的最高的日志条目的索引
     int last_applied_ = 0; // 已被应用到状态机的最高的日志条目的索引
     // 领导人上的易失性状态
-    std::vector<int> next_index_;  // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导人最后的日志条目的索引+1）
-    std::vector<int> match_index_; // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
+    int next_index_[100];  // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导人最后的日志条目的索引+1）
+    int match_index_[100]; // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
 
-    ThreadPool *thread_pool_;                               // 线程池
-    buttonrpc server_;                                      // rpc服务器
-    buttonrpc client_[100];                                 // rpc客户端， 用于发送信息
+    ThreadPool *thread_pool_; // 线程池
+    buttonrpc server_;        // rpc服务器
+    buttonrpc client_[100];   // rpc客户端， 用于发送信息
+    // int client_socket_[100];                                // 客户端套接字
     std::unordered_map<std::string, std::string> kv_store_; // 键值对
     int id_;                                                // 节点id
     int leader_id_ = -1;                                    // 领导者id， 不存在则为-1
@@ -86,18 +105,21 @@ private:
     std::chrono::system_clock::duration hduration_;         // 心跳计时超时时间
     std::mutex emutex_;                                     // 选举时间锁
     std::mutex hmutex_;                                     // 心跳时间锁
-    std::condition_variable cv_;                            // 条件变量
-    std::mutex cv_mtx_;                                     // 互斥锁
+    std::condition_variable server_cv_;                     // 服务器启动条件变量
+    std::mutex server_cv_mtx_;                              // 互斥锁
     std::shared_mutex state_mtx_;                           // 状态锁
     std::shared_mutex votes_mtx_;                           // 票数锁
     std::shared_mutex term_mtx_;                            // 任期锁
     std::shared_mutex log_mtx_;                             // 日志锁
+    std::condition_variable leaderid_cv_;                   // 领导者id条件变量
+    std::mutex leaderid_cv_mtx_;                            // 领导者id调节变量的互斥锁
+    std::vector<LogEntry> log_tosent_;                      // 需要发送的日志
+    std::condition_variable apply_cv_;                      // 应用日志条件变量
+    std::mutex apply_cv_mtx_;                               // 应用日志条件变量的锁
 
     std::thread etimer_thread_; // 选举定时器线程
     std::thread htimer_thread_; // 心跳定时器线程
     std::vector<int> nodes_;    // 所有节点的信息
-
-    bool is_recvmsg_ = false; // 是否收到客户端信息
 };
 
 #endif

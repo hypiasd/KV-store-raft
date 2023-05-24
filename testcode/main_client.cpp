@@ -40,58 +40,39 @@ struct PersonInfo
 
 int main()
 {
-    buttonrpc client[2];
-    client[0].as_client("127.0.0.1", 5555);
-    client[0].set_timeout(2000);
-    client[1].as_client("127.0.0.1", 5555);
-    client[1].set_timeout(2000);
-
-    std::cout << "start call..." << std::endl;
-    int t = 3;
-    while (t--)
-    {
-        std::cout << t << std::endl;
-        {
-            if (t == 2)
-                break;
-        }
-    }
-    auto foo3r = client[0].call<int>("foo_3", 10).val();
-    std::cout << foo3r << std::endl;
-    int foo4r = client[1].call<int>("foo_4", 10, "buttonrpc", 100, (float)10.8).val();
-    std::cout << foo4r << std::endl;
+    buttonrpc client;
     int callcnt = 0;
-    //     while (1)
-    //     {
-    //         std::cout << "current call count: " << ++callcnt << std::endl;
+    while (1)
+    {
+        std::cout << "current call count: " << ++callcnt << std::endl;
 
-    //         client.call<void>("foo_1");
+        client.call<void>("foo_1");
 
-    //         client.call<void>("foo_2", 10);
+        client.call<void>("foo_2", 10);
 
-    //         int foo3r = client.call<int>("foo_3", 10).val();
-    //         buttont_assert(foo3r == 100);
+        int foo3r = client.call<int>("foo_3", 10).val();
+        buttont_assert(foo3r == 100);
 
-    //         int foo4r = client.call<int>("foo_4", 10, "buttonrpc", 100, (float)10.8).val();
-    //         buttont_assert(foo4r == 1000);
+        int foo4r = client.call<int>("foo_4", 10, "buttonrpc", 100, (float)10.8).val();
+        buttont_assert(foo4r == 1000);
 
-    //         PersonInfo dd = {10, "buttonrpc", 170};
-    //         dd = client.call<PersonInfo>("foo_5", dd, 120).val();
-    //         buttont_assert(dd.age == 20);
-    //         buttont_assert(dd.name == "buttonrpc is good");
-    //         buttont_assert(dd.height == 180);
+        PersonInfo dd = {10, "buttonrpc", 170};
+        dd = client.call<PersonInfo>("foo_5", dd, 120).val();
+        buttont_assert(dd.age == 20);
+        buttont_assert(dd.name == "buttonrpc is good");
+        buttont_assert(dd.height == 180);
 
-    //         int foo6r = client.call<int>("foo_6", 10, "buttonrpc", 100).val();
-    //         buttont_assert(foo6r == 1000);
+        int foo6r = client.call<int>("foo_6", 10, "buttonrpc", 100).val();
+        buttont_assert(foo6r == 1000);
 
-    //         buttonrpc::value_t<void> xx = client.call<void>("foo_7", 666);
-    //         buttont_assert(!xx.valid());
-    // #ifdef _WIN32
-    //         Sleep(1000);
-    // #else
-    //         sleep(1);
-    // #endif
-    //     }
+        buttonrpc::value_t<void> xx = client.call<void>("foo_7", 666);
+        buttont_assert(!xx.valid());
+#ifdef _WIN32
+        Sleep(1000);
+#else
+        sleep(1);
+#endif
+    }
 
     return 0;
 }
