@@ -15,25 +15,27 @@ enum ret_type
     STATE_CHANGE,
     TIMEOUT
 };
-KVStore::KVStore(int id, std::vector<int> &info, size_t num_thread)
+KVStore::KVStore(int id, std::vector<int> &info, size_t num_thread) : Server(info[id])
 {
     id_ = id;
     nodes_ = info;
     num_nodes_ = nodes_.size();
-    log_.push_back(LogEntry()); // log索引从1开始
+    LogEntry tmp;
+    tmp.term = 0;
+    log_.push_back(tmp); // log索引从1开始
     thread_pool_ = new ThreadPool(num_thread);
+    hduration_ = std::chrono::milliseconds(50); // 50ms发送一次心跳
     std::thread server_thread([this](int port)
                               {
-        server_.as_server(port);
-        server_.bind("vote", &KVStore::vote, this);
-        server_.bind("append", &KVStore::append, this);
-        server_.bind("request", &KVStore::request, this);
+        rpc_server_ = new rpc_server(port, std::thread::hardware_concurrency());
+        rpc_server_->register_handler("vote", &KVStore::vote, this);
+        rpc_server_->register_handler("append", &KVStore::append, this);
         {std::lock_guard<std::mutex> lock(server_cv_mtx_);
         server_cv_.notify_one();}
         {std::lock_guard<std::mutex> lock(print_mtx);
         std::cout << "run rpc server on: " << port << std::endl;}
-        server_.run(); },
-                              nodes_[id_]);
+        rpc_server_->run(); },
+                              nodes_[id_] + num_nodes_);
     {
         std::unique_lock<std::mutex> lock(server_cv_mtx_);
         server_cv_.wait(lock);
@@ -42,18 +44,27 @@ KVStore::KVStore(int id, std::vector<int> &info, size_t num_thread)
     {
         if (i != id_)
         {
-            client_[i].as_client("127.0.0.1", nodes_[i]);
-            client_[i].set_timeout(50); // 50ms超时重传
+            rpc_client_[i] = new rpc_client("127.0.0.1", nodes_[i] + num_nodes_);
         }
     }
-    transition(follower);
     thread_pool_->enqueue(&KVStore::apply, this);
+    thread_pool_->enqueue(&KVStore::start, this);
+    transition(follower);
     server_thread.join();
 }
 
 KVStore::~KVStore()
 {
     delete thread_pool_;
+}
+
+void KVStore::start()
+{
+    {
+        std::lock_guard<std::mutex> lock(print_mtx);
+        std::cout << "run tcp server on: " << port_ << std::endl;
+    }
+    Server::start();
 }
 
 void KVStore::transition(state st)
@@ -148,11 +159,17 @@ int KVStore::start_timer()
 {
     if (state_ == leader)
     {
-        auto res = thread_pool_->enqueue_ret(&KVStore::heartbeat_timeout, this);
-        int ret = res.get();
+        std::future<int> th[num_nodes_];
+        for (int i = 0; i < num_nodes_; i++)
+            if (i != id_)
+                th[i] = thread_pool_->enqueue_ret([this](int i)
+                                                  { return heartbeat_timeout(i); },
+                                                  i);
+        int ret;
+        for (int i = 0; i < num_nodes_; i++)
+            if (i != id_)
+                ret = th[i].get();
         return ret;
-        // htimer_thread_ = std::thread(&KVStore::heartbeat_timeout, this);
-        // htimer_thread_.detach();
     }
     else
     {
@@ -179,47 +196,18 @@ void KVStore::start_election()
         if (i != id_)
             thread_pool_->enqueue([this, i]()
                                   { send2other(i, "vote"); });
-        // if (i != id_)
-        //     election_threads.emplace_back([this, i]()
-        //                                   { send2other(i, "vote"); });
     }
-    // for (auto &thread : election_threads)
-    // {
-    //     thread.detach();
-    // }
 }
 
-void KVStore::start_heartbeat()
+void KVStore::start_heartbeat(int id)
 {
-    // std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
-
-    // // 将时间点转换为毫秒（以 std::chrono::milliseconds 表示）
-    // auto duration = now.time_since_epoch();
-    // auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-
-    // {
-    //     std::lock_guard<std::mutex> lock(print_mtx);
-    //     std::cout << id_ << ":start heartbeat!!!   " << ms << std::endl;
-    // }
-
-    // {
-    //     std::lock_guard<std::mutex> lock(print_mtx);
-    //     std::cout << id_ << ":start heartbeat!!!" << std::endl;
-    // }
-    for (int i = 0; i < num_nodes_; ++i)
-    {
-        if (i != id_)
-            thread_pool_->enqueue([this, i]()
-                                  { send2other(i, "append"); });
-        // {
-        //     std::lock_guard<std::mutex> lock(print_mtx);
-        //     std::cout << id_ << ":start append to " << i << std::endl;
-        // }
-    }
+    thread_pool_->enqueue([this, id]()
+                          { send2other(id, "append"); });
 }
 
 void KVStore::send2other(int id, std::string func)
 {
+    rpc_client_[id]->connect();
     if (func == "vote")
     {
         while (1)
@@ -229,82 +217,130 @@ void KVStore::send2other(int id, std::string func)
                 if (state_ != candidate)
                     break;
             }
-            auto recv = client_[id].call<RequestVoteRet>("vote", id_, term_);
-            if (recv.error_msg() == "recv timeout")
-                continue;
-            else if (recv.val().vote_granted)
+            try
             {
+                int log_index;
                 {
-                    std::unique_lock<std::shared_mutex> lock(votes_mtx_);
-                    votes_received_++;
+                    std::shared_lock<std::shared_mutex> lock(log_mtx_);
+                    log_index = log_.size() - 1;
                 }
+                int log_term = log_[log_index].term;
+                auto recv = rpc_client_[id]->call<RequestVoteRet>("vote", id_, term_, log_index, log_term);
+
+                if (recv.vote_granted)
                 {
-                    std::lock_guard<std::mutex> lock(print_mtx);
-                    std::cout << id << ":  vote to  " << id_ << std::endl;
+                    {
+                        std::unique_lock<std::shared_mutex> lock(votes_mtx_);
+                        votes_received_++;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(print_mtx);
+                        std::cout << id << ":  vote to  " << id_ << std::endl;
+                    }
+                }
+                else
+                {
+                    if (recv.term > term_)
+                    {
+                        std::unique_lock<std::shared_mutex> lock(state_mtx_);
+                        state_ = follower;
+                    }
                 }
             }
+            catch (const std::exception &e)
+            {
+                std::cerr << e.what() << '\n';
+            }
+
             return;
         }
     }
     else if (func == "append")
     {
-        int prev_log_index = next_index_[id];
+        LogEntry log_tosent;
+        log_tosent.term = 0;
+        if (next_index_[id] < log_.size())
+        {
+            log_tosent = log_[next_index_[id]];
+            std::lock_guard<std::mutex> lock(print_mtx);
+            std::cout << "id:  " << id << std::endl;
+            std::cout << "next_index_[id]:  " << next_index_[id] << std::endl;
+            std::cout << "log size:  " << log_.size() << std::endl;
+            std::cout << "log_tosent term:  " << log_tosent.term << std::endl;
+        }
+        int prev_log_index = next_index_[id] - 1;
         int prev_log_term = 0;
         if (prev_log_index >= 0)
             prev_log_term = log_[prev_log_index].term;
 
-        if (log_tosent_.size())
+        // {
+        //     std::lock_guard<std::mutex> lock(print_mtx);
+        //     std::cout << "id:  " << id << std::endl;
+        //     std::cout << "index: " << prev_log_index << "  term: " << prev_log_term << std::endl;
+        //     std::cout << "log2sent: " << log_tosent.term << std::endl;
+        //     std::cout << "log size:  " << log_.size() << std::endl;
+        // }
+        auto recv = rpc_client_[id]->call<AppendEntriesRet>("append", term_, id_, prev_log_index, prev_log_term, log_tosent, commit_index_);
+        if (log_tosent.term)
         {
             std::lock_guard<std::mutex> lock(print_mtx);
-            std::cout << id << "  log_tosent:" << std::endl;
-            std::cout << log_tosent_[0].term << log_tosent_[0].func_name << log_tosent_[0].key
-                      << log_tosent_[0].value << std::endl;
+            std::cout << "recv:  " << recv.success << std::endl;
         }
-        std::string test = "hahahah";
-        std::shared_lock<std::shared_mutex> lock(log_mtx_);
-        auto recv = client_[id].call<AppendEntriesRet>("append", test, term_, id_, prev_log_index, prev_log_term, log_tosent_, commit_index_);
-        // log_tosent_.clear();
-        lock.unlock();
-        if (recv.error_msg() == "recv timeout")
-        {
-            {
-                std::lock_guard<std::mutex> lock(print_mtx);
-                std::cout << "recv timeout!!!" << std::endl;
-            }
-        }
-        else
-        {
-            if (!recv.val().success)
-            {
-                if ([&]()
-                    {   std::shared_lock<std::shared_mutex> lock(term_mtx_);
-                            return recv.val().term > term_; }())
-                {
-                    {
-                        std::unique_lock<std::shared_mutex> lock(state_mtx_);
-                        state_ = follower;
-                    }
 
-                    {
-                        std::unique_lock<std::shared_mutex> lock(term_mtx_);
-                        term_ = recv.val().term;
-                    }
-                }
-                else
+        if (!recv.success)
+        {
+            if ([&]()
+                {   std::shared_lock<std::shared_mutex> lock(term_mtx_);
+                        return recv.term > term_; }())
+            {
                 {
-                    next_index_[id]--;
+                    std::unique_lock<std::shared_mutex> lock(state_mtx_);
+                    state_ = follower;
+                }
+
+                {
+                    std::unique_lock<std::shared_mutex> lock(term_mtx_);
+                    term_ = recv.term;
                 }
             }
             else
             {
-                match_index_[id] = next_index_[id];
-                next_index_[id]++;
+                next_index_[id]--;
             }
+        }
+        else if (log_tosent.term)
+        {
+            {
+                std::lock_guard<std::mutex> lock(log_cnt_mtx_);
+                log_[next_index_[id]].recv_cnt++;
+                if (log_[next_index_[id]].recv_cnt == (num_nodes_ / 2 + num_nodes_ % 2))
+                {
+                    commit_index_++;
+                    {
+                        std::lock_guard<std::mutex> lock(print_mtx);
+                        std::cout << "commit:  " << commit_index_ << std::endl;
+                        std::cout << "log size:  " << log_.size() << std::endl;
+                        std::cout << "index:  " << next_index_[id] << std::endl;
+                    }
+                    std::lock_guard<std::mutex> lock(apply_cv_mtx_);
+                    apply_cv_.notify_one();
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(print_mtx);
+                std::cout << "next_index of " << id << ": ++!!" << std::endl;
+                std::cout << "log_tosent:  " << log_tosent.term << std::endl;
+                std::cout << "log size:  " << log_.size() << std::endl;
+                std::cout << "index:  " << next_index_[id] << std::endl;
+                std::cout << "cnt:  " << log_[next_index_[id]].recv_cnt << "|" << (num_nodes_ / 2 + num_nodes_ % 2) << std::endl;
+            }
+            match_index_[id] = next_index_[id];
+            next_index_[id]++;
         }
     }
 }
 
-RequestVoteRet KVStore::vote(int id, int term, int log_index, int log_term)
+RequestVoteRet KVStore::vote(rpc_conn conn, int id, int term, int log_index, int log_term)
 {
     RequestVoteRet ret;
     if ([&]()
@@ -321,6 +357,13 @@ RequestVoteRet KVStore::vote(int id, int term, int log_index, int log_term)
         }
         int lindex = commit_index_;
         int lterm = log_[lindex].term;
+
+        {
+            std::lock_guard<std::mutex> lock(print_mtx);
+            std::cout << term_ << "|" << term << std::endl;
+            std::cout << lindex << "|" << log_index << std::endl;
+            std::cout << lterm << "|" << log_term << std::endl;
+        }
 
         if (log_term < lterm)
             ret.vote_granted = false;
@@ -342,11 +385,11 @@ RequestVoteRet KVStore::vote(int id, int term, int log_index, int log_term)
             voted_for_ = id;
         }
     }
-
+    ret.term = term_;
     return ret;
 }
 
-AppendEntriesRet KVStore::append(std::string test, int term, int lid, int prev_log_index, int prev_log_term, vector<LogEntry> entries, int lcommit)
+AppendEntriesRet KVStore::append(rpc_conn conn, int term, int lid, int prev_log_index, int prev_log_term, LogEntry entry, int lcommit)
 {
     AppendEntriesRet ret;
     if ([&]()
@@ -375,7 +418,7 @@ AppendEntriesRet KVStore::append(std::string test, int term, int lid, int prev_l
         }
 
         // 如果是心跳
-        if (entries.empty())
+        if (entry.func_name == "")
         {
             if ([&]()
                 {   std::shared_lock<std::shared_mutex> lock(state_mtx_);
@@ -394,7 +437,7 @@ AppendEntriesRet KVStore::append(std::string test, int term, int lid, int prev_l
             }
             ret.success = true;
         }
-        else // 添加日志
+        else if (entry.term) // 添加日志
         {
             if (prev_log_term != log_[prev_log_index].term)
             {
@@ -402,21 +445,12 @@ AppendEntriesRet KVStore::append(std::string test, int term, int lid, int prev_l
             }
             else
             {
-                int len1 = entries.size(), len2 = log_.size();
-                for (int i = 0, idx = prev_log_index + 1; i < len1; i++, idx++)
-                {
-                    if (idx < len2)
-                    {
-                        if (log_[idx].term != entries[i].term)
-                        {
-                            log_[idx] = entries[i];
-                            log_.erase(log_.begin() + idx + 1, log_.end());
-                            len2 = log_.size();
-                        }
-                    }
-                    else
-                        log_.emplace_back(entries[i]);
-                }
+                int idx = prev_log_index + 1;
+                std::unique_lock<std::shared_mutex> lock(log_mtx_);
+                if (idx < log_.size())
+                    log_[idx] = entry;
+                else
+                    log_.emplace_back(entry);
                 ret.success = true;
             }
         }
@@ -424,71 +458,6 @@ AppendEntriesRet KVStore::append(std::string test, int term, int lid, int prev_l
 
     ret.term = term_;
     return ret;
-}
-
-ClientReqRet KVStore::request(std::string func, std::string key, std::string value)
-{
-    {
-        std::lock_guard<std::mutex> lock(print_mtx);
-        std::cout << id_ << ":  get request!!!   " << std::endl;
-    }
-    {
-        std::unique_lock<std::mutex> lock(leaderid_cv_mtx_);
-        leaderid_cv_.wait(lock, [this]
-                          { return leader_id_ != -1; });
-    }
-    ClientReqRet ret;
-    ret.leader_id = leader_id_;
-    ret.info = "OK";
-    ret.value = "";
-    if (leader_id_ != id_)
-    {
-        ret.leader_id = leader_id_;
-        return ret;
-    }
-    LogEntry tmp = {term_, func, key, value};
-
-    {
-        std::lock_guard<std::mutex> lock(print_mtx);
-        std::cout << id_ << ":  append log!!!   " << std::endl;
-    }
-
-    {
-        std::unique_lock<std::shared_mutex> lock(log_mtx_);
-        log_tosent_.emplace_back(tmp);
-    }
-    log_.emplace_back(tmp);
-
-    return ret;
-    // std::future<int> th[num_nodes_];
-    // for (int i = 0; i < num_nodes_; ++i)
-    // {
-    //     if (i != id_)
-    //         th[i] = thread_pool_->enqueue_ret([this, i]() -> int
-    //                                           { send2other(i, "append"); return 1; });
-    // }
-    // // 等待线程结束
-    // for (int i = 0; i < num_nodes_; ++i)
-    // {
-    //     if (i != id_)
-    //         int tmp = th[i].get();
-    // }
-}
-
-ClientReqRet KVStore::set(std::string key, std::string value)
-{
-    ClientReqRet ret;
-}
-
-ClientReqRet KVStore::get(std::string key)
-{
-    ClientReqRet ret;
-}
-
-ClientReqRet KVStore::del(std::string key)
-{
-    ClientReqRet ret;
-    kv_store_.erase(key);
 }
 
 int KVStore::election_timeout()
@@ -535,11 +504,10 @@ int KVStore::election_timeout()
     }
 }
 
-int KVStore::heartbeat_timeout()
+int KVStore::heartbeat_timeout(int id)
 {
-    hstart_ = std::chrono::system_clock::now();
-    hduration_ = std::chrono::milliseconds(50); // 50ms发送一次心跳
-    std::chrono::system_clock::time_point end = hstart_;
+    hstart_[id] = std::chrono::system_clock::now();
+    std::chrono::system_clock::time_point end = hstart_[id];
     while (1)
     {
         // 状态改变了，leader变follower
@@ -548,15 +516,14 @@ int KVStore::heartbeat_timeout()
             if (state_ != leader || voted_for_ != -1)
                 return STATE_CHANGE;
         }
-
-        if (log_tosent_.size() || std::chrono::system_clock::now() >= end)
+        if (std::chrono::system_clock::now() >= end)
         {
-            start_heartbeat();
+            start_heartbeat(id);
             {
                 std::unique_lock<std::mutex> lock(hmutex_);
-                hstart_ = std::chrono::system_clock::now();
+                hstart_[id] = std::chrono::system_clock::now();
             }
-            end = hstart_ + hduration_;
+            end = hstart_[id] + hduration_;
         }
     }
 }
@@ -565,19 +532,178 @@ void KVStore::apply()
 {
     while (1)
     {
+        // {
+        //     std::lock_guard<std::mutex> lock(print_mtx);
+        //     std::cout << last_applied_ << "|" << commit_index_ << std::endl;
+        // }
         if (last_applied_ == commit_index_)
         {
-            std::unique_lock<std::mutex> lock(server_cv_mtx_);
-            server_cv_.wait(lock);
+            std::unique_lock<std::mutex> lock(apply_cv_mtx_);
+            apply_cv_.wait(lock);
         }
-
-        for (int i = last_applied_ + 1; i <= commit_index_ || i < log_.size(); i++)
+        // {
+        //     std::lock_guard<std::mutex> lock(print_mtx);
+        //     std::cout << "start apply" << std::endl;
+        // }
+        for (int i = last_applied_ + 1; i <= commit_index_ && i < log_.size(); i++)
         {
             auto t = log_[++last_applied_];
-            if (t.func_name == "set")
-                kv_store_[t.key] = t.value;
-            else if (t.func_name == "del")
-                kv_store_.erase(t.key);
+            {
+                std::lock_guard<std::mutex> lock(print_mtx);
+                std::cout << id_ << " apply:  " << t.func_name << std::endl;
+                std::cout << "key:  " << t.key << std::endl;
+                std::cout << "value:  " << t.set_value << std::endl;
+            }
+            if (t.func_name == "SET")
+                kv_store_[t.key] = t.set_value;
+            else if (t.func_name == "DEL")
+            {
+                num_del_ = 0;
+                for (auto x : t.del_key)
+                {
+                    if (kv_store_.find(x) != kv_store_.end())
+                    {
+                        kv_store_.erase(x);
+                        num_del_++;
+                    }
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(req_cv_mtx_);
+        req_cv_.notify_one();
+    }
+}
+
+void KVStore::handle_client(int client_socket, const char *buffer)
+{
+    {
+        std::lock_guard<std::mutex> lock(print_mtx);
+        std::cout << id_ << ":  get request!!!   " << std::endl;
+    }
+    {
+        std::unique_lock<std::mutex> lock(leaderid_cv_mtx_);
+        leaderid_cv_.wait(lock, [this]
+                          { return leader_id_ != -1; });
+    }
+    if (leader_id_ != id_)
+    {
+        std::string response_str = "127.0.0.1:" + std::to_string(nodes_[leader_id_]);
+        send2client(client_socket, response_str);
+        return;
+    }
+    thread_pool_->enqueue([this, buffer, client_socket]()
+                          { handle_all(client_socket, buffer); });
+}
+
+void KVStore::handle_all(int client_socket, const char *buffer)
+{
+    ClientReq request = decode(buffer);
+    std::string response_str;
+    if (request.success)
+    {
+        LogEntry log = request.log_info;
+        log.term = term_;
+        log.recv_cnt = 1;
+        {
+            std::lock_guard<std::mutex> lock(print_mtx);
+            std::cout << "request:  " << log.func_name << std::endl;
+        }
+        if (log.func_name == "GET")
+        {
+            if (kv_store_.find(log.key) == kv_store_.end())
+            {
+                response_str = "*1\r\n$3\r\nnil\r\n";
+            }
+            else
+            {
+                std::string value = kv_store_[log.key];
+                std::string resp;
+                int start = 0;
+                int cnt = 0;
+                while (start < value.size())
+                {
+                    size_t pos1 = value.find(' ', start);
+                    if (pos1 == std::string::npos)
+                        pos1 = value.size();
+                    resp.append("$" + std::to_string(pos1 - start));
+                    resp.append("\r\n" + value.substr(start, pos1 - start) + "\r\n");
+                    start = pos1 + 1;
+                    cnt++;
+                }
+                response_str = "*" + std::to_string(cnt) + resp;
+            }
+        }
+        else
+        {
+            {
+                std::unique_lock<std::shared_mutex> lock(log_mtx_);
+                log_.emplace_back(log);
+            }
+            {
+                std::unique_lock<std::mutex> lock(req_cv_mtx_);
+                req_cv_.wait(lock);
+            }
+            if (log.func_name == "SET")
+                response_str = "+OK\r\n";
+            else
+                response_str = ":" + std::to_string(num_del_) + "\r\n";
         }
     }
+    else
+        response_str = "-ERROR\r\n";
+    send2client(client_socket, response_str);
+}
+
+void KVStore::send2client(int client_socket, std::string response_str)
+{
+    if (send(client_socket, response_str.c_str(), response_str.size(), 0) == -1)
+    {
+        perror("Send response to client failed");
+    }
+    close(client_socket);
+}
+
+ClientReq KVStore::decode(const char *buffer)
+{
+    ClientReq ret;
+    if (buffer[0] != '*')
+    {
+        std::cerr << "format is wrong!!!";
+        ret.success = false;
+        return ret;
+    }
+    std::string str(buffer);
+    int pos1 = str.find("\r\n");
+    int num_string = std::atoi(str.substr(1, pos1 - 1).c_str());
+    int start = pos1 + 1;
+    for (int i = 0; i < num_string; i++)
+    {
+        int pos2 = str.find("$", start);
+        start = pos2 + 1;
+        int pos3 = str.find("\r\n", pos2);
+        int len = std::atoi(str.substr(pos2 + 1, pos3 - pos2 - 1).c_str());
+        if (i == 0)
+        {
+            ret.log_info.func_name = str.substr(pos3 + 2, len);
+        }
+        else
+        {
+            if (ret.log_info.func_name != "DEL")
+            {
+                if (i == 1)
+                    ret.log_info.key = str.substr(pos3 + 2, len);
+                else if (i == 2)
+                    ret.log_info.set_value.append(str.substr(pos3 + 2, len));
+                else
+                    ret.log_info.set_value.append(" " + str.substr(pos3 + 2, len));
+            }
+            else
+            {
+                ret.log_info.del_key.push_back(str.substr(pos3 + 2, len));
+            }
+        }
+    }
+    ret.success = true;
+    return ret;
 }

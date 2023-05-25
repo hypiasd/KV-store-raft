@@ -182,7 +182,9 @@ void KVStore::transition(state st)
 >
 > 1、跟随者可以先后同意给不同的节点投票，前提是节点的优先级不同
 
+### 3、返回操作
 
+若收到拒绝投票，且recv.term > term_则状态变更为跟随者
 
 ## 七、领导者
 

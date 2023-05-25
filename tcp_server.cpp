@@ -9,6 +9,7 @@
 
 Server::Server(int port)
 {
+    port_ = port;
     // 创建socket
     server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket_ < 0)
@@ -34,7 +35,6 @@ Server::Server(int port)
         std::cerr << "Failed to bind socket." << std::endl;
         return;
     }
-    std::cout << "server create on " << port << std::endl;
 }
 
 Server::~Server()
@@ -61,7 +61,6 @@ void Server::start()
     while (true)
     {
         int num_events = epoll.Wait();
-        std::cout << "hh" << std::endl;
 
         // 处理每个事件
         for (int i = 0; i < num_events; ++i)

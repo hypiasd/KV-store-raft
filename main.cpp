@@ -3,14 +3,14 @@
 std::mutex print_mtx;
 int main()
 {
-    std::vector<int> tmp({12340, 12341, 12342, 12343, 12344});
+    std::vector<int> tmp({12340, 12341, 12342});
     // std::vector<int> tmp({12340});
     int num = tmp.size();
     std::vector<std::thread> threads;
     for (int i = 0; i < num; ++i)
     {
         threads.emplace_back([&tmp, i]()
-                             { KVStore kv(i, tmp, 5); });
+                             { KVStore kv(i, tmp, 10); });
     }
     for (auto &thread : threads)
     {

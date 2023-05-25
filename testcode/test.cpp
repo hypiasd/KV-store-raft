@@ -1,11 +1,7 @@
 #include <iostream>
 
-auto func(std::string flag)
+int main()
 {
-    if (flag == "")
-        return 2;
-    else if (flag == "int")
-        return 1;
-    else if (flag == "double")
-        return 3.14;
+    std::string x = "127.0.0.1" + 1;
+    std::cout << x;
 }
